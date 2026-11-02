@@ -1,4 +1,5 @@
 /**
+ * NEON CRM — servidor v13.10.1 (v13.10 + API de agendamentos do painel)
  * NEON CRM — servidor v13.10 (multi-provedor WhatsApp: Evolution API | Uazapi).
  * Núcleo: contatos, deals, inbox WhatsApp, AI Gateway (OpenAI),
  * Prospecção Ativa (Google Places + disparo com guardrails).
@@ -687,6 +688,100 @@ app.get('/media/:token', (req, res) => {
 });
 
 /* ---------------- UI (protegida por login quando configurado) ---------------- */
+/* v13.10.1: tabela de agendamentos do painel (Agenda) — criada cedo;
+   nunca derruba o boot. Idempotente. */
+try {
+  await query(`CREATE TABLE IF NOT EXISTS appointments (
+    id SERIAL PRIMARY KEY,
+    conversation_id INTEGER NOT NULL,
+    service TEXT,
+    scheduled_for TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'confirmado',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
+  await query(`CREATE UNIQUE INDEX IF NOT EXISTS appointments_conv_slot_uniq ON appointments (conversation_id, scheduled_for)`);
+  console.log('[boot] ✅ tabela de agendamentos pronta');
+} catch (e) { console.error('[boot] appointments:', e.message); }
+
+/* ---------------- API: agenda (v13.12) — o painel vê e gere ---------------- */
+app.get('/api/appointments', requirePanelAuth, async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days) || 21, 1), 90);
+    const r = await query(
+      `SELECT a.id, a.service, a.scheduled_for, a.status, a.created_at,
+              cv.id AS conversation_id, cv.contact_id, ct.name AS contact_name, ct.wa_id
+         FROM appointments a
+         JOIN conversations cv ON cv.id = a.conversation_id
+         LEFT JOIN contacts ct ON ct.id = cv.contact_id
+        WHERE a.scheduled_for >= now() - interval '7 days'
+          AND a.scheduled_for <= now() + ($1 || ' days')::interval
+        ORDER BY a.scheduled_for ASC LIMIT 500`,
+      [days]);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: String(e.message) }); }
+});
+
+app.post('/api/appointments', requirePanelAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!String(b.name || '').trim() || !String(b.wa_id || '').trim())
+      return res.status(400).json({ error: 'nome e wa_id do cliente são obrigatórios' });
+    const when = new Date(b.scheduled_for || '');
+    if (isNaN(when)) return res.status(400).json({ error: 'scheduled_for inválido (ISO com fuso, ex.: 2026-10-17T14:00:00-03:00)' });
+    // acha o contato pelo WhatsApp (cria se for novo) e a conversa dele
+    let ct = (await query(`SELECT id FROM contacts WHERE wa_id = $1`, [b.wa_id])).rows[0];
+    if (!ct) ct = (await query(
+      `INSERT INTO contacts (wa_id, name) VALUES ($1,$2) RETURNING id`,
+      [b.wa_id, String(b.name).slice(0, 120)])).rows[0];
+    else if (b.name) await query(`UPDATE contacts SET name = $2 WHERE id = $1 AND (name IS NULL OR name = '')`,
+      [ct.id, String(b.name).slice(0, 120)]); // v13.26.1: perfil do WhatsApp preenche contato sem nome
+    let cv = (await query(
+      `SELECT id FROM conversations WHERE contact_id = $1 ORDER BY id DESC LIMIT 1`,
+      [ct.id])).rows[0];
+    if (!cv) cv = (await query(
+      `INSERT INTO conversations (contact_id, wa_chat_id) VALUES ($1,$2) RETURNING id`,
+      [ct.id, b.wa_id.includes('@') ? b.wa_id : b.wa_id + '@s.whatsapp.net'])).rows[0];
+    const status = ['confirmado', 'pendente', 'concluido', 'cancelado'].includes(b.status) ? b.status : 'confirmado';
+    const ins = await query(
+      `INSERT INTO appointments (conversation_id, service, scheduled_for, status)
+       VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING *`,
+      [cv.id, String(b.service || '').slice(0, 200) || null, when.toISOString(), status]);
+    if (!ins.rows[0]) return res.status(409).json({ error: 'já existe agendamento idêntico para esta conversa' });
+    res.json(ins.rows[0]);
+  } catch (e) { res.status(500).json({ error: String(e.message) }); }
+});
+
+app.patch('/api/appointments/:id', requirePanelAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const sets = [], vals = [];
+    if (b.service !== undefined) { sets.push(`service = $${sets.length + 1}`); vals.push(String(b.service).slice(0, 200)); }
+    if (b.scheduled_for !== undefined) {
+      const d = new Date(b.scheduled_for);
+      if (isNaN(d)) return res.status(400).json({ error: 'scheduled_for inválido' });
+      sets.push(`scheduled_for = $${sets.length + 1}`); vals.push(d.toISOString());
+    }
+    if (b.status !== undefined) {
+      if (!['confirmado', 'pendente', 'concluido', 'cancelado'].includes(b.status))
+        return res.status(400).json({ error: 'status inválido (confirmado|pendente|concluido|cancelado)' });
+      sets.push(`status = $${sets.length + 1}`); vals.push(b.status);
+    }
+    if (!sets.length) return res.status(400).json({ error: 'nada para atualizar' });
+    vals.push(req.params.id);
+    const up = await query(`UPDATE appointments SET ${sets.join(', ')} WHERE id = $${vals.length} RETURNING *`, vals);
+    if (!up.rows[0]) return res.status(404).json({ error: 'agendamento não encontrado' });
+    res.json(up.rows[0]);
+  } catch (e) { res.status(500).json({ error: String(e.message) }); }
+});
+
+app.delete('/api/appointments/:id', requirePanelAuth, async (req, res) => {
+  try {
+    const del = await query(`DELETE FROM appointments WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!del.rows[0]) return res.status(404).json({ error: 'agendamento não encontrado' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message) }); }
+});
+
 app.use(requirePanelAuth);
 // HTML sempre fresco (sem cache de navegador) — evita "painel velho" após Deploy.
 app.use(express.static(path.join(__dirname, '..', 'public'), {
